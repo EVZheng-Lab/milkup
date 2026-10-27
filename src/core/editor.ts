@@ -354,8 +354,18 @@ export class MilkupEditor implements IMilkupEditor {
    */
   setMarkdown(content: string): void {
     const { doc } = this.parser.parse(content);
+    const current = this.view.state.doc;
+    // 只替换差异区间：保存后回读等内容相同/近似的同步不会把光标挤到文末
+    const start = current.content.findDiffStart(doc.content);
+    if (start === null) return;
+    let { a: endA, b: endB } = current.content.findDiffEnd(doc.content)!;
+    const overlap = start - Math.min(endA, endB);
+    if (overlap > 0) {
+      endA += overlap;
+      endB += overlap;
+    }
     const tr = this.view.state.tr
-      .replaceWith(0, this.view.state.doc.content.size, doc.content)
+      .replace(start, endA, doc.slice(start, endB))
       .setMeta("addToHistory", false);
     this.view.dispatch(tr);
   }
@@ -847,7 +857,11 @@ export class MilkupEditor implements IMilkupEditor {
     plain: string,
     cut: boolean
   ): boolean {
-    const payload = this.createRichClipboardPayload(view, plain);
+    const payload = this.createRichClipboardPayload(
+      view,
+      plain,
+      this.getSingleTableCellSelectionSlice()
+    );
     const result = writeClipboardEvent(event, payload);
     if (cut && !canDeleteAfterClipboardWrite(payload, result)) {
       event.preventDefault();
@@ -910,15 +924,21 @@ export class MilkupEditor implements IMilkupEditor {
     });
   }
 
-  private createRichClipboardPayload(view: EditorView, plain: string): ClipboardPayload {
+  private createRichClipboardPayload(
+    view: EditorView,
+    plain: string,
+    inlineSlice: Slice | null = null
+  ): ClipboardPayload {
     const sourceView = this.isSourceViewEnabled();
     const imageMode = sourceView ? undefined : this.getClipboardImageMode();
     try {
       const renderedRoot =
-        sourceView || !shouldUseRenderedClipboardDom(view)
+        sourceView || inlineSlice || !shouldUseRenderedClipboardDom(view)
           ? null
           : getRenderedSelectionRoot(view, imageMode);
-      const dom = renderedRoot ?? view.serializeForClipboard(view.state.selection.content()).dom;
+      const dom =
+        renderedRoot ??
+        view.serializeForClipboard(inlineSlice ?? view.state.selection.content()).dom;
       return this.buildClipboardPayloadForDom(dom, plain, sourceView, imageMode);
     } catch (error) {
       console.error("生成富文本剪贴板失败", error);
@@ -1908,9 +1928,25 @@ export class MilkupEditor implements IMilkupEditor {
     return this.serializeSliceToMarkdown(this.view.state.selection.content());
   }
 
+  /** 选区落在同一个单元格内时，返回只含所选行内内容的切片（不带表格外壳）。 */
+  private getSingleTableCellSelectionSlice(): Slice | null {
+    const { selection } = this.view.state;
+    if (selection.empty) return null;
+    const { $from, $to } = selection;
+    if (!$from.sameParent($to)) return null;
+    const cellType = $from.parent.type.name;
+    if (cellType !== "table_cell" && cellType !== "table_header") return null;
+    return $from.parent.slice($from.parentOffset, $to.parentOffset);
+  }
+
   private serializeTableSelectionForClipboard(): string | null {
     const { selection } = this.view.state;
     if (selection.empty) return null;
+
+    // 单元格内部分选中：只复制选中的文字，而不是整格
+    if (this.getSingleTableCellSelectionSlice()) {
+      return this.view.state.doc.textBetween(selection.from, selection.to);
+    }
 
     const from = selection.from;
     const to = selection.to;
